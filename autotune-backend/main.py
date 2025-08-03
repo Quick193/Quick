@@ -14,7 +14,7 @@ CORS(app)  # Enable CORS for React frontend
 
 UPLOAD_FOLDER = 'uploads'
 PROCESSED_FOLDER = 'processed'
-ALLOWED_EXTENSIONS = {'mp3', 'wav'}
+ALLOWED_EXTENSIONS = {'mp3', 'wav', 'flac', 'ogg'}
 
 # Create directories if they don't exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -123,7 +123,7 @@ def autotune_audio(y, sr, strength=0.8, scale_freqs=None):
     
     return autotuned_y
 
-def process_audio(input_path, output_path, filetype, strength=0.8):
+def process_audio(input_path, output_path, output_format, strength=0.8):
     """
     Process the audio file with autotune effect
     """
@@ -134,19 +134,58 @@ def process_audio(input_path, output_path, filetype, strength=0.8):
         y, sr = librosa.load(input_path, sr=None)
         print(f"Loaded audio - Sample rate: {sr}, Duration: {len(y)/sr:.2f}s")
         
+        # Ensure we have a reasonable sample rate
+        if sr < 22050:
+            print(f"Upsampling from {sr} to 22050 Hz")
+            y = librosa.resample(y, orig_sr=sr, target_sr=22050)
+            sr = 22050
+        
         # Apply autotune effect
         print(f"Applying autotune with strength: {strength}")
         autotuned_y = autotune_audio(y, sr, strength=strength)
         
-        # Normalize audio to prevent clipping
-        autotuned_y = librosa.util.normalize(autotuned_y)
+        # Normalize audio to prevent clipping but preserve dynamic range
+        max_val = np.max(np.abs(autotuned_y))
+        if max_val > 0:
+            autotuned_y = autotuned_y / max_val * 0.95  # Leave some headroom
         
-        # Save the processed audio
+        # Ensure the audio is in the correct format
+        autotuned_y = np.asarray(autotuned_y, dtype=np.float32)
+        
+        # Handle different output formats
+        if output_format.lower() == 'mp3':
+            # For MP3, we need to use pydub since soundfile doesn't support MP3
+            temp_wav_path = output_path.replace('.mp3', '_temp.wav')
+            
+            # First save as WAV
+            sf.write(temp_wav_path, autotuned_y, sr, subtype='PCM_16')
+            
+            # Convert to MP3 using pydub
+            audio = AudioSegment.from_wav(temp_wav_path)
+            audio.export(output_path, format="mp3", bitrate="192k")
+            
+            # Clean up temp file
+            os.remove(temp_wav_path)
+            
+        elif output_format.lower() == 'wav':
+            # Use PCM_16 format for better compatibility
+            sf.write(output_path, autotuned_y, sr, subtype='PCM_16')
+            
+        elif output_format.lower() == 'flac':
+            sf.write(output_path, autotuned_y, sr, format='FLAC')
+            
+        else:  # Default to WAV
+            sf.write(output_path, autotuned_y, sr, subtype='PCM_16')
+        
         print(f"Saving processed audio to: {output_path}")
-        sf.write(output_path, autotuned_y, sr)
         
-        print("Audio processing completed successfully")
-        return True
+        # Verify the file was created and has content
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print("Audio processing completed successfully")
+            return True
+        else:
+            print("Error: Output file was not created or is empty")
+            return False
         
     except Exception as e:
         print(f"Error processing audio: {e}")
@@ -167,30 +206,42 @@ def upload_file():
     strength = float(request.form.get('strength', 0.8))
     strength = max(0.1, min(1.0, strength))  # Clamp between 0.1 and 1.0
     
+    # Get output format preference (default to original format)
+    output_format = request.form.get('output_format', 'wav').lower()
+    if output_format not in ['wav', 'mp3', 'flac']:
+        output_format = 'wav'  # Default to WAV
+    
     if file and allowed_file(file.filename):
         # Generate unique filename
         file_id = str(uuid.uuid4())
         filename = secure_filename(file.filename)
-        file_extension = filename.rsplit('.', 1)[1].lower()
+        original_extension = filename.rsplit('.', 1)[1].lower()
         
         # Save uploaded file
-        input_filename = f"{file_id}_input.{file_extension}"
+        input_filename = f"{file_id}_input.{original_extension}"
         input_path = os.path.join(UPLOAD_FOLDER, input_filename)
         file.save(input_path)
         
         # Process the audio with autotune
-        output_filename = f"{file_id}_processed.wav"  # Always output as WAV for quality
+        output_filename = f"{file_id}_processed.{output_format}"
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
         
-        success = process_audio(input_path, output_path, file_extension, strength)
+        success = process_audio(input_path, output_path, output_format, strength)
+        
+        # Clean up input file to save space
+        try:
+            os.remove(input_path)
+        except:
+            pass
         
         if success:
             return jsonify({
                 'message': 'File processed successfully with autotune',
                 'file_id': file_id,
                 'original_name': filename,
-                'processed_name': f"{filename.rsplit('.', 1)[0]}_autotuned.wav",
-                'strength_used': strength
+                'processed_name': f"{filename.rsplit('.', 1)[0]}_autotuned.{output_format}",
+                'strength_used': strength,
+                'output_format': output_format
             }), 200
         else:
             return jsonify({'error': 'Failed to process audio with autotune'}), 500
@@ -200,22 +251,59 @@ def upload_file():
 @app.route('/download/<file_id>')
 def download_file(file_id):
     try:
-        output_filename = f"{file_id}_processed.wav"
-        output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+        # Check for different possible output formats
+        for ext in ['wav', 'mp3', 'flac']:
+            output_filename = f"{file_id}_processed.{ext}"
+            output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+            
+            if os.path.exists(output_path):
+                # Verify file has content
+                if os.path.getsize(output_path) > 0:
+                    return send_file(
+                        output_path, 
+                        as_attachment=True,
+                        download_name=f"{file_id}_autotuned.{ext}",
+                        mimetype=f'audio/{ext}' if ext != 'wav' else 'audio/wav'
+                    )
+                else:
+                    return jsonify({'error': 'Processed file is empty'}), 500
         
-        if os.path.exists(output_path):
-            return send_file(output_path, as_attachment=True, 
-                           download_name=f"{file_id}_autotuned.wav")
-        else:
-            return jsonify({'error': 'File not found'}), 404
+        return jsonify({'error': 'File not found'}), 404
+        
     except Exception as e:
+        print(f"Download error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/status', methods=['GET'])
 def status():
     return jsonify({'status': 'AutoTune server is running'}), 200
 
+@app.route('/cleanup', methods=['POST'])
+def cleanup_files():
+    """Clean up old processed files to save disk space"""
+    try:
+        import time
+        current_time = time.time()
+        cleaned_count = 0
+        
+        for folder in [UPLOAD_FOLDER, PROCESSED_FOLDER]:
+            for filename in os.listdir(folder):
+                filepath = os.path.join(folder, filename)
+                # Remove files older than 1 hour
+                if os.path.getmtime(filepath) < current_time - 3600:
+                    os.remove(filepath)
+                    cleaned_count += 1
+        
+        return jsonify({
+            'message': f'Cleaned up {cleaned_count} old files',
+            'count': cleaned_count
+        }), 200
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     print("Starting AutoTune Flask server...")
-    print("Make sure you have installed: pip install librosa soundfile")
-    app.run(debug=True, port=5000)
+    print("Make sure you have installed: pip install librosa soundfile pydub")
+    print("For MP3 support, also install: pip install pydub[mp3]")
+    app.run(debug=True, port=5001)
